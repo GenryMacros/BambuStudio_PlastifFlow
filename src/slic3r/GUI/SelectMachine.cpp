@@ -54,6 +54,9 @@
 #include "Notebook.hpp"
 #include "BitmapCache.hpp"
 #include "BindDialog.hpp"
+#include "nlohmann/json.hpp"
+#include <boost/algorithm/string/predicate.hpp>
+#include <boost/filesystem/path.hpp>
 
 // definitions
 #define S_RACK_NOZZLE_OFFSET_CALI_WARNING _L(\
@@ -3183,6 +3186,80 @@ void SelectMachineDialog::Enable_Auto_Refill(bool enable)
     m_ams_backup_tip->Refresh();
 }
 
+// ---------------------------------------------------------------------------------------------
+// PlastiFlow: build the JSON that is POSTed to the local API when a print is sent.
+// ---------------------------------------------------------------------------------------------
+
+// Name used as the key in the "models" dict: the file name the object was imported from
+// (e.g. "Benchy.stl"), never an internal Bambu id. If the only known source is the project
+// .3mf itself (objects created/downloaded inside a 3mf) we fall back to the object's name
+// as shown in the object list.
+static std::string plastiflow_model_name(const ModelObject *object)
+{
+    auto file_name_of = [](const std::string &path) -> std::string {
+        if (path.empty()) return {};
+        boost::filesystem::path p(path);
+        if (boost::algorithm::iends_with(p.filename().string(), ".3mf")) return {};
+        return p.filename().string();
+    };
+
+    for (const ModelVolume *volume : object->volumes) {
+        if (volume && volume->is_model_part()) {
+            std::string name = file_name_of(volume->source.input_file);
+            if (!name.empty()) return name;
+        }
+    }
+    std::string name = file_name_of(object->input_file);
+    return name.empty() ? object->name : name;
+}
+
+static std::string plastiflow_build_report(Plater *plater, int plate_idx, const std::string &project_name, const wxString &displayed_time)
+{
+    if (plater == nullptr) return {};
+    PartPlateList &plate_list = plater->get_partplate_list();
+    if (plate_idx < 0) plate_idx = plate_list.get_curr_plate_index();
+    PartPlate *plate = plate_list.get_plate(plate_idx);
+    if (plate == nullptr) return {};
+
+    // model file name -> number of printable instances on this plate
+    nlohmann::json models = nlohmann::json::object();
+    const Model &model = plater->model();
+    for (const auto &obj_inst : plate->get_obj_and_inst_set()) {
+        const int obj_idx  = obj_inst.first;
+        const int inst_idx = obj_inst.second;
+        if (obj_idx < 0 || obj_idx >= (int) model.objects.size()) continue;
+        const ModelObject *object = model.objects[obj_idx];
+        if (object == nullptr || inst_idx < 0 || inst_idx >= (int) object->instances.size()) continue;
+        if (!object->instances[inst_idx]->printable) continue;
+
+        const std::string name = plastiflow_model_name(object);
+        models[name] = models.value(name, 0) + 1;
+    }
+
+    // plastic
+    double weight_g = 0., length_m = 0.;
+    if (Print *print = plate->fff_print()) {
+        weight_g = print->print_statistics().total_weight;
+        length_m = print->print_statistics().total_used_filament / 1000.; // mm -> m
+    }
+
+    // time (seconds, as estimated by the slicer for normal mode)
+    double time_s = 0.;
+    if (const GCodeProcessorResult *result = plate->get_slice_result())
+        if (!result->print_statistics.modes.empty())
+            time_s = result->print_statistics.modes[0].time;
+
+    nlohmann::json body;
+    body["models"]             = models;
+    body["plastic_required_g"] = weight_g;
+    body["plastic_required_m"] = length_m;
+    body["time_required_s"]    = time_s;
+    body["time_required_text"] = displayed_time.utf8_string(); // what the print dialog shows
+    body["project_name"]       = project_name;
+    body["plate_index"]        = plate_idx + 1;
+    return body.dump();
+}
+
 void SelectMachineDialog::on_send_print()
 {
     BOOST_LOG_TRIVIAL(info) << "print_job: on_ok to send";
@@ -3401,6 +3478,16 @@ void SelectMachineDialog::on_send_print()
 
     BOOST_LOG_TRIVIAL(info) << "print_job: timelapse_option = " << timelapse_option;
     BOOST_LOG_TRIVIAL(info) << "print_job: use_ams = " << m_print_job->task_use_ams;
+
+    // PlastiFlow: prepare the report now (UI thread); PrintJob POSTs it once the printer accepted the job.
+    if (m_print_type == PrintFromType::FROM_NORMAL) {
+        try {
+            m_print_job->plastiflow_report_payload =
+                plastiflow_build_report(m_plater, m_print_plate_idx, m_print_job->m_project_name, m_stext_time->GetLabel());
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(error) << "plastiflow: failed to build report: " << e.what();
+        }
+    }
 
     m_print_job->on_success([this]() { finish_mode(); });
 

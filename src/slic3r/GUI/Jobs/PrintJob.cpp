@@ -1,5 +1,6 @@
 #include "PrintJob.hpp"
 #include <regex>
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -18,9 +19,35 @@
 #include "slic3r/GUI/DeviceCore/DevUtil.h"
 
 #include "slic3r/Utils/FileTransferUtils.hpp"
+#include "slic3r/Utils/Http.hpp"
 
 namespace Slic3r {
 namespace GUI {
+
+// PlastiFlow: report a successfully sent print to the local API (default http://localhost:7888/bambu).
+// The URL can be overridden with the PLASTIFLOW_API_URL environment variable.
+// The request is asynchronous and fire-and-forget: a failure is only logged and never affects printing.
+static void plastiflow_post_print_report(const std::string &payload)
+{
+    if (payload.empty()) return;
+    std::string url = "http://localhost:7888/bambu";
+    if (const char *env_url = std::getenv("PLASTIFLOW_API_URL"); env_url != nullptr && *env_url != '\0')
+        url = env_url;
+
+    BOOST_LOG_TRIVIAL(info) << "plastiflow: POST " << url << " body=" << payload;
+    Http::post(url)
+        .header("Content-Type", "application/json")
+        .timeout_connect(5)
+        .timeout_max(15)
+        .set_post_body(payload)
+        .on_complete([url](std::string body, unsigned status) {
+            BOOST_LOG_TRIVIAL(info) << "plastiflow: " << url << " answered " << status << ": " << body;
+        })
+        .on_error([url](std::string body, std::string error, unsigned status) {
+            BOOST_LOG_TRIVIAL(error) << "plastiflow: request to " << url << " failed, status=" << status << ", error=" << error << ", body=" << body;
+        })
+        .perform();
+}
 
 #define CHECK_GCODE_FAILED_STR      _L("Abnormal print file data. Please slice again.")
 #define PRINTJOB_CANCEL_STR         _L("Task canceled.")
@@ -892,6 +919,7 @@ void PrintJob::process()
         wxGetApp().plater()->record_slice_preset("print");
 
         BOOST_LOG_TRIVIAL(error) << "print_job: send ok.";
+        plastiflow_post_print_report(plastiflow_report_payload);
         wxCommandEvent* evt = new wxCommandEvent(m_print_job_completed_id);
         if (!m_completed_evt_data.empty())
             evt->SetString(m_completed_evt_data);

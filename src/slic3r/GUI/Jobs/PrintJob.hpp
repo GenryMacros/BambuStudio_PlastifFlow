@@ -58,6 +58,9 @@ public:
     virtual bool is_print_job() const override { return true; }
 
     std::string m_project_name;
+    // PlastiFlow: JSON body POSTed to the local API after the job was successfully sent to the printer.
+    // Empty => no report (e.g. calibration jobs, prints started from the printer's storage).
+    std::string plastiflow_report_payload;
     std::string m_dev_ip;
     std::string m_ftp_folder;
     std::string m_access_code;
